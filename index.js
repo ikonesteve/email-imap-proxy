@@ -135,6 +135,7 @@ app.post("/test", async (req, res) => {
   console.log(`[test] Connecting to ${connection.imap_host}:${config.port} as ${connection.email}`);
 
   const client = new ImapFlow(config);
+  client.on('error', (err) => console.error(`[test] ImapFlow error: ${err.code || err.message}`));
   try {
     await client.connect();
     const mailboxes = await client.list();
@@ -157,12 +158,18 @@ app.post("/test", async (req, res) => {
 
 // ── POST /fetch ──────────────────────────────────────────────
 app.post("/fetch", async (req, res) => {
-  const { connection, folder = "INBOX", limit = 30, offset = 0, since, include_body = true } = req.body;
+  const { connection, folder = "INBOX", limit = 30, offset = 0, since, include_body = true, search_message_id } = req.body;
   if (!connection?.imap_host) {
     return res.status(400).json({ error: "Connection config required" });
   }
 
   const client = new ImapFlow(getImapConfig(connection));
+
+  // Prevent unhandled 'error' events from crashing the process
+  client.on('error', (err) => {
+    console.error(`[fetch] ImapFlow background error: ${err.code || err.message}`);
+  });
+
   try {
     await client.connect();
     const lock = await client.getMailboxLock(folder);
@@ -170,10 +177,10 @@ app.post("/fetch", async (req, res) => {
     try {
       const status = await client.status(folder, { messages: true, unseen: true });
       const total = status.messages || 0;
-      const start = Math.max(1, total - offset - limit + 1);
-      const end = Math.max(1, total - offset);
 
       if (total === 0) {
+        lock.release();
+        await client.logout();
         return res.json({ emails: [], total: 0, folder });
       }
 
@@ -181,7 +188,28 @@ app.post("/fetch", async (req, res) => {
       let range;
       let useUid = false;
 
-      if (since) {
+      // ── Priority 1: search by Message-ID header ──
+      if (search_message_id) {
+        try {
+          const uids = await client.search({ header: { 'Message-ID': search_message_id } }, { uid: true });
+          if (uids.length > 0) {
+            range = uids.join(',');
+            useUid = true;
+            console.log(`[fetch] Found ${uids.length} message(s) for Message-ID search`);
+          } else {
+            console.warn(`[fetch] No message found for Message-ID: ${search_message_id}`);
+            lock.release();
+            await client.logout();
+            return res.json({ emails: [], total, folder, unseen: status.unseen || 0 });
+          }
+        } catch (searchErr) {
+          console.warn(`[fetch] Message-ID search failed: ${searchErr.message}, falling back to sequence`);
+          // Fall through to sequence-based fetch
+        }
+      }
+
+      // ── Priority 2: search by SINCE date ──
+      if (!range && since) {
         const sinceDate = new Date(since);
         sinceDate.setDate(sinceDate.getDate() - 1);
         try {
@@ -196,15 +224,22 @@ app.post("/fetch", async (req, res) => {
           useUid = true;
         } catch (searchErr) {
           console.warn(`[fetch] SINCE search failed, falling back to sequence: ${searchErr.message}`);
-          const start = Math.max(1, total - offset - limit + 1);
-          const end = Math.max(1, total - offset);
-          range = `${start}:${end}`;
         }
-      } else {
-        const start = Math.max(1, total - offset - limit + 1);
+      }
+
+      // ── Priority 3: sequence-based range (default) ──
+      if (!range) {
         const end = Math.max(1, total - offset);
+        const start = Math.max(1, end - limit + 1);
+        if (end < 1 || start > total) {
+          lock.release();
+          await client.logout();
+          return res.json({ emails: [], total, folder, unseen: status.unseen || 0 });
+        }
         range = `${start}:${end}`;
       }
+
+      console.log(`[fetch] Fetching range="${range}" useUid=${useUid} folder=${folder}`);
 
       // ── Charset mapping for Node.js Buffer.toString() ──────────
       const CHARSET_TO_NODE = {
@@ -367,6 +402,8 @@ app.post("/fetch", async (req, res) => {
     const { msg, details } = formatImapError(err, connection.imap_host);
     console.error(`[fetch] IMAP error:`, JSON.stringify(details, null, 2));
     res.status(502).json({ error: msg, details });
+    // Try to disconnect gracefully
+    try { await client.logout(); } catch (_) {}
   }
 });
 
@@ -407,6 +444,7 @@ app.post("/folders", async (req, res) => {
   }
 
   const client = new ImapFlow(getImapConfig(connection));
+  client.on('error', (err) => console.error(`[folders] ImapFlow error: ${err.code || err.message}`));
   try {
     await client.connect();
     const mailboxes = await client.list();
@@ -435,6 +473,7 @@ app.post("/update", async (req, res) => {
   }
 
   const client = new ImapFlow(getImapConfig(connection));
+  client.on('error', (err) => console.error(`[update] ImapFlow error: ${err.code || err.message}`));
   try {
     await client.connect();
     const lock = await client.getMailboxLock("INBOX");
