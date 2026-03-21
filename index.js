@@ -231,7 +231,8 @@ app.post("/fetch", async (req, res) => {
       if (!range) {
         const end = Math.max(1, total - offset);
         const start = Math.max(1, end - limit + 1);
-        if (end < 1 || start > total) {
+        if (end < 1 || start > total || start < 1 || end < start) {
+          console.warn(`[fetch] Invalid sequence range: start=${start}, end=${end}, total=${total}, offset=${offset}. Returning empty.`);
           lock.release();
           await client.logout();
           return res.json({ emails: [], total, folder, unseen: status.unseen || 0 });
@@ -275,6 +276,27 @@ app.post("/fetch", async (req, res) => {
           }
         }
         return buf.toString(encoding);
+      }
+
+      function extractAttachmentsMeta(structure, prefix = "") {
+        const attachments = [];
+        if (!structure?.childNodes) return attachments;
+        for (let i = 0; i < structure.childNodes.length; i++) {
+          const child = structure.childNodes[i];
+          const partNum = prefix ? `${prefix}.${i + 1}` : `${i + 1}`;
+          const disp = (child.disposition || "").toLowerCase();
+          const ct = (child.type || "").toLowerCase();
+          if (disp === "attachment" || (ct && !ct.startsWith("text/") && !ct.startsWith("multipart/"))) {
+            attachments.push({
+              name: child.dispositionParameters?.filename || child.parameters?.name || `part-${partNum}`,
+              size: child.size || 0,
+              mime: child.type || "application/octet-stream",
+              part: partNum,
+            });
+          }
+          if (child.childNodes) attachments.push(...extractAttachmentsMeta(child, partNum));
+        }
+        return attachments;
       }
 
       function findBodyParts(structure, prefix = "") {
@@ -373,6 +395,8 @@ app.post("/fetch", async (req, res) => {
 
         const snippetSource = bodyText || bodyHtml.replace(/<[^>]+>/g, ' ');
 
+        const attachmentsMeta = extractAttachmentsMeta(msg.bodyStructure);
+
         emails.push({
           message_id: env.messageId || msg.uid.toString(),
           from_address: from.address || "",
@@ -386,7 +410,8 @@ app.post("/fetch", async (req, res) => {
           is_read: msg.flags?.has("\\Seen") || false,
           is_starred: msg.flags?.has("\\Flagged") || false,
           priority: msg.flags?.has("\\Important") ? "urgent" : "normal",
-          has_attachments: (msg.bodyStructure?.childNodes?.length || 0) > 1,
+          has_attachments: attachmentsMeta.length > 0 || (msg.bodyStructure?.childNodes?.length || 0) > 1,
+          attachments_meta: attachmentsMeta,
           uid: msg.uid,
         });
       }
